@@ -313,7 +313,13 @@ endfunction
 
 function! s:client() abort
   silent doautocmd User ForeplayPreConnect
-  let buf = exists('s:input') ? s:input : '%'
+  if exists('s:input')
+    let buf = s:input
+  elseif has_key(s:qffiles, expand('%:p'))
+    let buf = s:qffiles[expand('%:p')].buffer
+  else
+    let buf = '%'
+  endif
   let root = simplify(fnamemodify(bufname(buf), ':p:s?[\/]$??'))
   let previous = ""
   while root !=# previous
@@ -334,7 +340,13 @@ function! foreplay#local_client(...)
   if !a:0
     silent doautocmd User ForeplayPreConnect
   endif
-  let buf = exists('s:input') ? s:input : '%'
+  if exists('s:input')
+    let buf = s:input
+  elseif has_key(s:qffiles, expand('%:p'))
+    let buf = s:qffiles[expand('%:p')].buffer
+  else
+    let buf = '%'
+  endif
   for repl in s:repls
     if repl.includes_file(fnamemodify(bufname(buf), ':p'))
       return repl
@@ -418,14 +430,65 @@ function! s:eval(expr, ...) abort
   return client.eval(a:expr, options)
 endfunction
 
+function! s:temp_response(response) abort
+  let output = []
+  if get(a:response, 'out', '') !=# ''
+    let output = map(split(a:response.out, "\n"), '";".v:val')
+  endif
+  if has_key(a:response, 'value')
+    let output += [a:response.value]
+  endif
+  let temp = tempname().'.clj'
+  call writefile(output, temp)
+  return temp
+endfunction
+
+if !exists('s:history')
+  let s:history = []
+endif
+
+if !exists('s:qffiles')
+  let s:qffiles = {}
+endif
+
+function! s:qfentry(entry) abort
+  if !has_key(a:entry, 'tempfile')
+    let a:entry.tempfile = s:temp_response(a:entry.response)
+  endif
+  let s:qffiles[a:entry.tempfile] = a:entry
+  return {'filename': a:entry.tempfile, 'text': a:entry.code}
+endfunction
+
+function! s:qfhistory() abort
+  let list = []
+  for entry in reverse(s:history)
+    if !has_key(entry, 'tempfile')
+      let entry.tempfile = s:temp_response(entry.response)
+    endif
+    call extend(list, [s:qfentry(entry)])
+  endfor
+  return list
+endfunction
+
 function! foreplay#eval(expr) abort
   let response = s:eval(a:expr, {'session': 1})
 
-  call s:output_response(response)
+  call insert(s:history, {'buffer': bufnr(''), 'code': a:expr, 'ns': foreplay#ns(), 'response': response})
+  if len(s:history) > &history
+    call remove(s:history, &history, -1)
+  endif
 
   if !empty(get(response, 'stacktrace', []))
-    call setloclist(0, foreplay#quickfix_for(response.stacktrace))
+    let nr = 0
+    if has_key(s:qffiles, expand('%:p'))
+      let nr = winbufnr(s:qffiles[expand('%:p')].buffer)
+    endif
+    if nr != -1
+      call setloclist(nr, foreplay#quickfix_for(response.stacktrace))
+    endif
   endif
+
+  call s:output_response(response)
 
   if get(response, 'ex', '') !=# ''
     let err = 'Clojure: '.response.ex
@@ -645,6 +708,22 @@ function! s:histswap(list) abort
   return old
 endfunction
 
+function! s:Last(bang, count) abort
+  if len(s:history) < a:count
+    return 'echoerr "History entry not found"'
+  endif
+  let history = s:qfhistory()
+  let last = s:qfhistory()[a:count-1]
+  execute 'pedit '.last.filename
+  let nr = winnr()
+  wincmd p
+  wincmd P
+  call setloclist(0, history)
+  silent exe 'llast '.(len(history)-a:count+1)
+  wincmd p
+  exe nr.'wincmd w'
+endfunction
+
 nnoremap <silent> <Plug>ForeplayPrintLast :exe <SID>print_last()<CR>
 nnoremap <silent> <Plug>ForeplayPrint  :<C-U>set opfunc=<SID>printop<CR>g@
 xnoremap <silent> <Plug>ForeplayPrint  :<C-U>call <SID>printop(visualmode())<CR>
@@ -661,6 +740,7 @@ noremap!          <Plug>ForeplayRecall <C-R>=<SID>recall()<CR>
 
 function! s:setup_eval() abort
   command! -buffer -bang -range=0 -nargs=? -complete=customlist,foreplay#eval_complete Eval :exe s:Eval(<bang>0, <line1>, <line2>, <count>, <q-args>)
+  command! -buffer -bang -bar -count=1 Last :exe s:Last(<bang>0, <count>)
 
   nmap <buffer> cp <Plug>ForeplayPrint
   nmap <buffer> cpp <Plug>ForeplayPrintab
@@ -872,6 +952,9 @@ function! foreplay#ns() abort
   let ns = matchstr(lines, '\C^(\s*\%(in-ns\s*''\|ns\s\+\)\zs[A-Za-z0-9_?*!+/=<>.-]\+\ze')
   if ns !=# ''
     return ns
+  endif
+  if has_key(s:qffiles, expand('%:p'))
+    return s:qffiles[expand('%:p')].ns
   endif
   let path = s:buffer_path()
   return s:tons(path ==# '' ? 'user' : path)
